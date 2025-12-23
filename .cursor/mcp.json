@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "conductor-bridge": {
+      "command": "python",
+      "args": ["-m", "conductor_bridge.server", "--http", "--port", "8765"],
+      "cwd": "C:\\conductor-bridge-mvp",
+      "env": {
+        "CONDUCTOR_BRIDGE_STATE_DIR": "C:\\conductor-bridge-mvp\\state"
+      }
+    }
+  }
+}
