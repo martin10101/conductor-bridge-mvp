@@ -24,6 +24,7 @@ from .conductor_cli_driver import ConductorCliDriver
 from .gemini_client import GeminiClient
 from .implementer import get_best_available_implementer, get_implementer
 from .quality_gate import evaluate_track
+from .reviewer import review_track
 from .state import StateManager
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -227,6 +228,8 @@ class Bridge:
                         "timeout_s": {"type": "integer"},
                         "quality_profile": {"type": "string", "enum": ["auto", "micro", "project"]},
                         "quality_retries": {"type": "integer"},
+                        "min_review_score": {"type": "integer"},
+                        "review_retries": {"type": "integer"},
                     },
                     "required": ["repo_dir", "project_brief", "track_description"],
                     "additionalProperties": False,
@@ -246,6 +249,8 @@ class Bridge:
                         "timeout_s": {"type": "integer"},
                         "quality_profile": {"type": "string", "enum": ["auto", "micro", "project"]},
                         "quality_retries": {"type": "integer"},
+                        "min_review_score": {"type": "integer"},
+                        "review_retries": {"type": "integer"},
                     },
                     "required": ["repo_dir", "project_brief", "track_description"],
                     "additionalProperties": False,
@@ -267,6 +272,40 @@ class Bridge:
                         "timeout_s": {"type": "integer"},
                     },
                     "required": ["repo_dir", "session_id", "user_input"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "conductor_review_track",
+                "description": "Review the latest Conductor track's spec/plan and score quality (1-10).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {"type": "string"},
+                        "track_id": {"type": "string"},
+                        "user_brief": {"type": "string"},
+                    },
+                    "required": ["repo_dir"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "conductor_review_and_refine",
+                "description": "Iteratively ask Conductor to revise spec/plan until the minimum review score is met (pauses on A/B prompts).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "project_brief": {"type": "string"},
+                        "track_description": {"type": "string"},
+                        "model": {"type": "string"},
+                        "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
+                        "timeout_s": {"type": "integer"},
+                        "min_score": {"type": "integer"},
+                        "max_rounds": {"type": "integer"},
+                    },
+                    "required": ["repo_dir", "session_id", "project_brief", "track_description"],
                     "additionalProperties": False,
                 },
             },
@@ -375,11 +414,63 @@ class Bridge:
         return self.state_manager.append_event(type, payload or {}).to_dict()
 
     def tool_run_shell_command(self, command: str, cwd: Optional[str] = None, timeout_s: int = 60) -> dict[str, Any]:
+        if not isinstance(command, str) or not command.strip():
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "command must be a non-empty string"}
+        if len(command) > 8000:
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "command too long"}
+
         workdir = cwd or os.getcwd()
+        try:
+            workdir_path = Path(workdir).resolve()
+        except Exception:
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "Invalid cwd"}
+
+        # Safety guardrails: keep commands scoped and block obviously destructive patterns.
+        allow_roots_env = os.environ.get("CONDUCTOR_BRIDGE_SHELL_ALLOWED_ROOTS") or ""
+        default_roots = [
+            Path(os.getcwd()),
+            Path.home() / "Downloads" / "codex-projects",
+        ]
+        extra = [Path(p.strip()) for p in allow_roots_env.split(",") if p.strip()]
+        allowed_roots = []
+        for r in [*default_roots, *extra]:
+            try:
+                allowed_roots.append(r.resolve())
+            except Exception:
+                continue
+
+        if allowed_roots:
+            in_root = any(str(workdir_path).lower().startswith(str(root).lower()) for root in allowed_roots)
+            if not in_root:
+                return {
+                    "ok": False,
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Refusing to run command outside allowed roots: {workdir_path}",
+                }
+
+        deny_patterns = [
+            (r"(?i)\b(remove-item|del|erase|rm|rmdir|rd)\b", "delete files"),
+            (r"(?i)\bformat\b", "format disk"),
+            (r"(?i)\bdiskpart\b", "disk partitioning"),
+            (r"(?i)\breg(\.exe)?\b", "registry editing"),
+            (r"(?i)\bshutdown\b|\brestart-computer\b|\bstop-computer\b", "shutdown/restart"),
+            (r"(?i)\btaskkill\b|\bstop-process\b", "kill processes"),
+            (r"(?i)\binvoke-expression\b|\biex\b", "execute dynamic code"),
+            (r"(?i)\bgit\s+clean\b", "destructive git clean"),
+            (r"(?i)\bgit\s+reset\s+--hard\b", "destructive git reset"),
+            (r"(?i)\bgit\s+push\s+--force\b", "force push"),
+        ]
+        for pat, reason in deny_patterns:
+            if re.search(pat, command):
+                return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"Blocked potentially dangerous command ({reason})."}
+
+        timeout_s = int(timeout_s) if isinstance(timeout_s, int) or str(timeout_s).isdigit() else 60
+        timeout_s = max(1, min(600, timeout_s))
         try:
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", command],
-                cwd=workdir,
+                cwd=str(workdir_path),
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,
@@ -395,6 +486,81 @@ class Bridge:
             return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"Timed out after {timeout_s}s"}
         except Exception as e:
             return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
+
+    def tool_conductor_review_track(self, repo_dir: str, track_id: str = "", user_brief: str = "") -> dict[str, Any]:
+        r = review_track(repo_dir=repo_dir, track_id=track_id or None, user_brief=user_brief)
+        return {
+            "ok": True,
+            "track_id": r.track_id,
+            "score_1_to_10": r.score_1_to_10,
+            "strengths": r.strengths,
+            "issues": r.issues,
+            "revision_prompt": r.revision_prompt,
+        }
+
+    def tool_conductor_review_and_refine(
+        self,
+        repo_dir: str,
+        session_id: str,
+        project_brief: str,
+        track_description: str,
+        model: Optional[str] = None,
+        approval_mode: str = "yolo",
+        timeout_s: int = 900,
+        min_score: int = 9,
+        max_rounds: int = 2,
+    ) -> dict[str, Any]:
+        driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
+        selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+
+        current_session_id = session_id
+        last_review = review_track(repo_dir=repo_dir, user_brief=project_brief)
+        for _round in range(max(0, int(max_rounds)) + 1):
+            last_review = review_track(repo_dir=repo_dir, user_brief=project_brief)
+            if last_review.score_1_to_10 >= int(min_score):
+                break
+            cont = driver.continue_session(
+                repo_dir=repo_dir,
+                model=selected_model,
+                session_id=current_session_id,
+                user_input=last_review.revision_prompt,
+                approval_mode=approval_mode,
+                timeout_s=timeout_s,
+                max_turns=4,
+                project_brief=project_brief,
+                track_description=track_description,
+                done_check=lambda: False,
+            )
+            current_session_id = cont.session_id or current_session_id
+            if cont.paused_for_user:
+                return {
+                    "ok": cont.ok,
+                    "model": selected_model,
+                    "session_id": current_session_id,
+                    "paused_for_user": True,
+                    "user_prompt": cont.user_prompt,
+                    "user_choices": cont.user_choices,
+                    "review": {
+                        "track_id": last_review.track_id,
+                        "score_1_to_10": last_review.score_1_to_10,
+                        "strengths": last_review.strengths,
+                        "issues": last_review.issues,
+                    },
+                    "transcript_tail": cont.transcript[-4000:],
+                }
+
+        return {
+            "ok": True,
+            "model": selected_model,
+            "session_id": current_session_id,
+            "paused_for_user": False,
+            "review": {
+                "track_id": last_review.track_id,
+                "score_1_to_10": last_review.score_1_to_10,
+                "strengths": last_review.strengths,
+                "issues": last_review.issues,
+            },
+        }
 
     def tool_write_artifact(self, name: str, content: str, artifacts_dir: Optional[str] = None) -> dict[str, Any]:
         self._write_artifact(name, content, artifacts_dir=artifacts_dir)
@@ -444,6 +610,8 @@ class Bridge:
         timeout_s: int = 900,
         quality_profile: str = "auto",
         quality_retries: int = 2,
+        min_review_score: int = 9,
+        review_retries: int = 2,
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
@@ -488,6 +656,35 @@ class Bridge:
                 if result.paused_for_user:
                     break
                 gate = evaluate_track(repo_dir=repo_dir, profile=quality_profile, user_brief=project_brief)
+
+        review = None
+        if result.ok and (not result.paused_for_user) and result.session_id and int(review_retries) >= 0:
+            review = review_track(repo_dir=repo_dir, user_brief=project_brief)
+            attempt = 0
+            while (
+                review is not None
+                and review.score_1_to_10 < int(min_review_score)
+                and attempt < max(0, int(review_retries))
+                and result.session_id
+                and (not result.paused_for_user)
+            ):
+                attempt += 1
+                cont = driver.continue_session(
+                    repo_dir=repo_dir,
+                    model=selected_model,
+                    session_id=result.session_id,
+                    user_input=review.revision_prompt,
+                    approval_mode=approval_mode,
+                    timeout_s=timeout_s,
+                    max_turns=4,
+                    project_brief=project_brief,
+                    track_description=track_description,
+                    done_check=lambda: False,
+                )
+                result = cont
+                if result.paused_for_user:
+                    break
+                review = review_track(repo_dir=repo_dir, user_brief=project_brief)
         return {
             "ok": result.ok,
             "model": selected_model,
@@ -500,6 +697,14 @@ class Bridge:
             "quality_gate": None
             if gate is None
             else {"ok": gate.ok, "profile": gate.profile, "issues": gate.issues, "track_id": gate.track_id},
+            "review": None
+            if review is None
+            else {
+                "track_id": review.track_id,
+                "score_1_to_10": review.score_1_to_10,
+                "strengths": review.strengths,
+                "issues": review.issues,
+            },
             "transcript_tail": result.transcript[-4000:],
         }
 
@@ -513,6 +718,8 @@ class Bridge:
         timeout_s: int = 900,
         quality_profile: str = "auto",
         quality_retries: int = 2,
+        min_review_score: int = 9,
+        review_retries: int = 2,
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
@@ -557,6 +764,35 @@ class Bridge:
                 if result.paused_for_user:
                     break
                 gate = evaluate_track(repo_dir=repo_dir, profile=quality_profile, user_brief=project_brief)
+
+        review = None
+        if result.ok and (not result.paused_for_user) and result.session_id and int(review_retries) >= 0:
+            review = review_track(repo_dir=repo_dir, user_brief=project_brief)
+            attempt = 0
+            while (
+                review is not None
+                and review.score_1_to_10 < int(min_review_score)
+                and attempt < max(0, int(review_retries))
+                and result.session_id
+                and (not result.paused_for_user)
+            ):
+                attempt += 1
+                cont = driver.continue_session(
+                    repo_dir=repo_dir,
+                    model=selected_model,
+                    session_id=result.session_id,
+                    user_input=review.revision_prompt,
+                    approval_mode=approval_mode,
+                    timeout_s=timeout_s,
+                    max_turns=4,
+                    project_brief=project_brief,
+                    track_description=track_description,
+                    done_check=lambda: False,
+                )
+                result = cont
+                if result.paused_for_user:
+                    break
+                review = review_track(repo_dir=repo_dir, user_brief=project_brief)
         return {
             "ok": result.ok,
             "model": selected_model,
@@ -569,6 +805,14 @@ class Bridge:
             "quality_gate": None
             if gate is None
             else {"ok": gate.ok, "profile": gate.profile, "issues": gate.issues, "track_id": gate.track_id},
+            "review": None
+            if review is None
+            else {
+                "track_id": review.track_id,
+                "score_1_to_10": review.score_1_to_10,
+                "strengths": review.strengths,
+                "issues": review.issues,
+            },
             "transcript_tail": result.transcript[-4000:],
         }
 

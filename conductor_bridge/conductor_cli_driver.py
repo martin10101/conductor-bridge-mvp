@@ -279,6 +279,7 @@ class ConductorCliDriver:
                 approval_mode=approval_mode,
                 session_id=session_id,
                 prompt=prompt,
+                timeout_s=min(120, max(5, int(timeout_s - (time.time() - start)))),
             )
             session_id = new_session_id or session_id
 
@@ -317,16 +318,8 @@ class ConductorCliDriver:
                 )
 
             if _needs_yes_no(assistant_text):
-                if pause_on_choices:
-                    return (
-                        False,
-                        session_id,
-                        "".join(transcript_parts),
-                        None,
-                        True,
-                        assistant_text.strip()[-1200:],
-                        ["yes", "no"],
-                    )
+                # Conductor sometimes asks "confirm/yes-no" questions for operational steps
+                # (e.g. proceed to read files). Default to "yes" to keep automation moving.
                 prompt = "yes"
                 continue
 
@@ -356,6 +349,7 @@ class ConductorCliDriver:
         approval_mode: str,
         session_id: Optional[str],
         prompt: str,
+        timeout_s: int,
     ) -> tuple[bool, Optional[str], str, str, Optional[str]]:
         gemini_exec: list[str]
         gemini_path = self.gemini_path
@@ -385,7 +379,9 @@ class ConductorCliDriver:
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
-                timeout=600,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s,
                 shell=False,
             )
         except subprocess.TimeoutExpired:

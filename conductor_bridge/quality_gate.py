@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .textio import read_text_auto
+
 
 @dataclass(frozen=True)
 class QualityGateResult:
@@ -70,24 +72,12 @@ def _mentions_unasked_features(md: str, user_brief: str) -> list[str]:
     return issues
 
 
-def _read_text_auto(path: Path) -> str:
-    data = path.read_bytes()
-    # BOM sniffing for common Windows cases
-    if data.startswith(b"\xff\xfe"):
-        return data[2:].decode("utf-16-le", errors="replace")
-    if data.startswith(b"\xfe\xff"):
-        return data[2:].decode("utf-16-be", errors="replace")
-    if data.startswith(b"\xef\xbb\xbf"):
-        return data.decode("utf-8-sig", errors="replace")
-    return data.decode("utf-8", errors="replace")
-
-
 def detect_latest_track_id(repo_dir: str) -> Optional[str]:
     repo = Path(repo_dir)
     tracks_file = repo / "conductor" / "tracks.md"
     if not tracks_file.exists():
         return None
-    txt = _read_text_auto(tracks_file)
+    txt = read_text_auto(tracks_file)
     matches = re.findall(r"\(\.\/conductor\/tracks\/([^/]+)\/\)", txt)
     return matches[-1] if matches else None
 
@@ -114,8 +104,8 @@ def evaluate_track(
             missing.append("plan.md")
         return QualityGateResult(ok=False, profile=profile, issues=[f"Missing track file(s): {', '.join(missing)}"], track_id=tid)
 
-    spec = _read_text_auto(spec_path)
-    plan = _read_text_auto(plan_path)
+    spec = read_text_auto(spec_path)
+    plan = read_text_auto(plan_path)
 
     chosen_profile = profile
     if profile == "auto":

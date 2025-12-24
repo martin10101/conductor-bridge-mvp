@@ -44,6 +44,13 @@ The server exposes these MCP tools at `http://127.0.0.1:8765/mcp`:
 | `get_state()` | Get current state |
 | `set_state(partial_update)` | Update state |
 | `append_event(type, payload)` | Log an event |
+| `autopilot_create_project(...)` | Create local project folder + GitHub repo |
+| `autopilot_push_branch(repo_dir, ...)` | Commit + push to a new branch |
+| `conductor_setup(repo_dir, ...)` | Run real Gemini CLI Conductor `/conductor:setup` |
+| `conductor_new_track(repo_dir, ...)` | Run real Gemini CLI Conductor `/conductor:newTrack` |
+| `conductor_continue(session_id, user_input, ...)` | Continue a paused Conductor session |
+| `conductor_review_track(repo_dir, ...)` | Score latest Conductor track (1-10) |
+| `conductor_review_and_refine(session_id, ...)` | Revision loop until score threshold |
 | `generate_spec(task_description, ...)` | Generate `spec.md` (Gemini) |
 | `generate_plan(task_description, ...)` | Generate `plan.md` (Gemini) |
 | `submit_handoff(handoff_markdown)` | Write `handoff.md` |
