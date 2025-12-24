@@ -151,19 +151,18 @@ def push_branch(
     status = _run(["git", "status", "--porcelain"], cwd=root)
     if status.returncode != 0:
         raise RuntimeError("git status failed")
-    if not status.stdout.strip():
-        return {"ok": "true", "pushed": "false", "reason": "no changes"}
 
     timestamp = _utc_slug_timestamp()
     branch_name = f"{branch_prefix}/{timestamp}"
 
     if _run(["git", "checkout", "-b", branch_name], cwd=root).returncode != 0:
         raise RuntimeError("git checkout -b failed")
-    _run(["git", "add", "-A"], cwd=root)
-    if _run(["git", "commit", "-m", message], cwd=root).returncode != 0:
-        raise RuntimeError("git commit failed")
+
+    if status.stdout.strip():
+        _run(["git", "add", "-A"], cwd=root)
+        if _run(["git", "commit", "-m", message], cwd=root).returncode != 0:
+            raise RuntimeError("git commit failed")
     if _run(["git", "push", "-u", "origin", branch_name], cwd=root).returncode != 0:
         raise RuntimeError("git push failed")
 
     return {"ok": "true", "pushed": "true", "branch": branch_name}
-

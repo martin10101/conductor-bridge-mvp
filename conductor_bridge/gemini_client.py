@@ -3,13 +3,21 @@
 import subprocess
 import shutil
 import os
-from typing import Optional, Tuple
+import time
+from pathlib import Path
+from typing import Optional, Tuple, List
 
 
 class GeminiClient:
     """Client for interacting with Gemini CLI."""
 
-    def __init__(self, timeout: int = 120, model: Optional[str] = None):
+    def __init__(self, timeout: int = 240, model: Optional[str] = None):
+        env_timeout = os.environ.get("CONDUCTOR_BRIDGE_GEMINI_TIMEOUT")
+        if env_timeout:
+            try:
+                timeout = int(env_timeout)
+            except ValueError:
+                pass
         self.timeout = timeout
         self.model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL")
         self._gemini_path: Optional[str] = None
@@ -32,6 +40,7 @@ class GeminiClient:
         timeout: Optional[int] = None,
         model: Optional[str] = None,
         extensions: Optional[list[str]] = None,
+        cwd: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Run a prompt through Gemini CLI.
@@ -65,6 +74,8 @@ class GeminiClient:
                 text=True,
                 timeout=timeout,
                 shell=False
+                ,
+                cwd=cwd
             )
 
             if result.returncode == 0:
@@ -202,3 +213,111 @@ Start the response with exactly: `# Review`
 Output in markdown format."""
 
         return self.run_prompt(prompt, model=model, extensions=extensions)
+
+    def run_interactive_script(
+        self,
+        *,
+        lines: List[str],
+        model: Optional[str] = None,
+        extensions: Optional[list[str]] = None,
+        approval_mode: str = "yolo",
+        timeout: Optional[int] = None,
+        cwd: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Run an interactive Gemini CLI session and feed it a list of lines (commands/answers).
+
+        Notes:
+        - Uses piped stdin/stdout (not a TTY). Some interactive UX may differ.
+        - Returns the combined stdout/stderr transcript.
+        """
+        if not self.is_available:
+            return False, "Gemini CLI is not available"
+
+        timeout = timeout or self.timeout
+
+        args: list[str] = [self.gemini_path]
+
+        selected_model = model or self.model
+        if selected_model:
+            args += ["--model", selected_model]
+
+        selected_extensions = extensions
+        if selected_extensions is None:
+            env_extensions = os.environ.get("CONDUCTOR_BRIDGE_GEMINI_EXTENSIONS")
+            if env_extensions:
+                selected_extensions = [e.strip() for e in env_extensions.split(",") if e.strip()]
+        if selected_extensions:
+            args += ["--extensions", *selected_extensions]
+
+        if approval_mode:
+            args += ["--approval-mode", approval_mode]
+
+        start = time.time()
+
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except Exception as e:
+            return False, f"Exception starting gemini: {e}"
+
+        transcript: list[str] = []
+
+        def _read_available_until(deadline: float) -> None:
+            if proc.stdout is None:
+                return
+            while time.time() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                transcript.append(line)
+
+        try:
+            if proc.stdin is None:
+                return False, "Failed to open stdin for gemini process"
+
+            for line in lines:
+                remaining = timeout - (time.time() - start)
+                if remaining <= 0:
+                    proc.kill()
+                    return False, "Command timed out before script completed"
+
+                proc.stdin.write(line.rstrip("\n") + "\n")
+                proc.stdin.flush()
+
+                # Give the CLI a moment to respond after each line.
+                _read_available_until(time.time() + 1.5)
+
+            # Close stdin to let the process exit if it wants to.
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+            # Drain output until exit or timeout.
+            while proc.poll() is None:
+                remaining = timeout - (time.time() - start)
+                if remaining <= 0:
+                    proc.kill()
+                    transcript.append("\n[bridge] Timeout: killed gemini process\n")
+                    break
+                _read_available_until(time.time() + 0.5)
+
+            _read_available_until(time.time() + 0.5)
+
+            ok = proc.returncode == 0
+            return ok, "".join(transcript)
+
+        finally:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass

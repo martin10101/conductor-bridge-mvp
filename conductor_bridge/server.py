@@ -12,6 +12,7 @@ import queue
 import re
 import sys
 import tempfile
+import subprocess
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .autopilot import create_project, push_branch
+from .conductor_cli_driver import ConductorCliDriver
 from .gemini_client import GeminiClient
 from .implementer import get_best_available_implementer, get_implementer
 from .state import StateManager
@@ -144,6 +146,20 @@ class Bridge:
                 },
             },
             {
+                "name": "run_shell_command",
+                "description": "Execute a PowerShell command (Gemini CLI Conductor compatibility).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "cwd": {"type": "string"},
+                        "timeout_s": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
+            {
                 "name": "get_artifacts",
                 "description": "Read spec.md, plan.md, handoff.md, and review.md from artifacts.",
                 "inputSchema": {
@@ -193,6 +209,40 @@ class Bridge:
                         "branch_prefix": {"type": "string"},
                     },
                     "required": ["repo_dir"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "conductor_setup",
+                "description": "Run real Gemini CLI Conductor `/conductor:setup` inside a repo to generate `conductor/` markdown files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {"type": "string"},
+                        "project_brief": {"type": "string"},
+                        "track_description": {"type": "string"},
+                        "model": {"type": "string"},
+                        "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
+                        "timeout_s": {"type": "integer"},
+                    },
+                    "required": ["repo_dir", "project_brief", "track_description"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "conductor_new_track",
+                "description": "Run real Gemini CLI Conductor `/conductor:newTrack` inside a repo to generate track spec/plan files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {"type": "string"},
+                        "project_brief": {"type": "string"},
+                        "track_description": {"type": "string"},
+                        "model": {"type": "string"},
+                        "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
+                        "timeout_s": {"type": "integer"},
+                    },
+                    "required": ["repo_dir", "project_brief", "track_description"],
                     "additionalProperties": False,
                 },
             },
@@ -300,6 +350,28 @@ class Bridge:
     def tool_append_event(self, type: str = "unknown", payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         return self.state_manager.append_event(type, payload or {}).to_dict()
 
+    def tool_run_shell_command(self, command: str, cwd: Optional[str] = None, timeout_s: int = 60) -> dict[str, Any]:
+        workdir = cwd or os.getcwd()
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                shell=False,
+            )
+            return {
+                "ok": result.returncode == 0,
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"Timed out after {timeout_s}s"}
+        except Exception as e:
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
+
     def tool_write_artifact(self, name: str, content: str, artifacts_dir: Optional[str] = None) -> dict[str, Any]:
         self._write_artifact(name, content, artifacts_dir=artifacts_dir)
         return {"ok": True, "artifact": _validate_artifact_name(name), "artifacts_dir": artifacts_dir}
@@ -337,6 +409,60 @@ class Bridge:
     ) -> dict[str, Any]:
         result = push_branch(repo_dir=repo_dir, message=message, branch_prefix=branch_prefix)
         return {"ok": True, "result": result}
+
+    def tool_conductor_setup(
+        self,
+        repo_dir: str,
+        project_brief: str,
+        track_description: str,
+        model: Optional[str] = None,
+        approval_mode: str = "yolo",
+        timeout_s: int = 900,
+    ) -> dict[str, Any]:
+        driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
+        selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+        result = driver.run_setup(
+            repo_dir=repo_dir,
+            model=selected_model,
+            approval_mode=approval_mode,
+            timeout_s=timeout_s,
+            project_brief=project_brief,
+            track_description=track_description,
+        )
+        return {
+            "ok": result.ok,
+            "model": selected_model,
+            "created_paths": result.created_paths,
+            "error": result.error,
+            "transcript_tail": result.transcript[-4000:],
+        }
+
+    def tool_conductor_new_track(
+        self,
+        repo_dir: str,
+        project_brief: str,
+        track_description: str,
+        model: Optional[str] = None,
+        approval_mode: str = "yolo",
+        timeout_s: int = 900,
+    ) -> dict[str, Any]:
+        driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
+        selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+        result = driver.run_new_track(
+            repo_dir=repo_dir,
+            model=selected_model,
+            approval_mode=approval_mode,
+            timeout_s=timeout_s,
+            project_brief=project_brief,
+            track_description=track_description,
+        )
+        return {
+            "ok": result.ok,
+            "model": selected_model,
+            "created_paths": result.created_paths,
+            "error": result.error,
+            "transcript_tail": result.transcript[-4000:],
+        }
 
     def tool_generate_spec(
         self,
