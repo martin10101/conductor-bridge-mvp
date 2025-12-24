@@ -8,6 +8,7 @@ turn-by-turn, automatically answering prompts with best-effort heuristics.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -281,7 +282,10 @@ class ConductorCliDriver:
                 approval_mode=approval_mode,
                 session_id=session_id,
                 prompt=prompt,
-                timeout_s=min(120, max(5, int(timeout_s - (time.time() - start)))),
+                timeout_s=min(
+                    int(os.environ.get("CONDUCTOR_BRIDGE_GEMINI_TURN_TIMEOUT_S") or "240"),
+                    max(5, int(timeout_s - (time.time() - start))),
+                ),
             )
             session_id = new_session_id or session_id
 
@@ -329,8 +333,17 @@ class ConductorCliDriver:
                 )
 
             if _needs_yes_no(assistant_text):
-                # Conductor sometimes asks "confirm/yes-no" questions for operational steps
-                # (e.g. proceed to read files). Default to "yes" to keep automation moving.
+                auto_yes = (os.environ.get("CONDUCTOR_BRIDGE_AUTO_YES_NO") or "").strip().lower() in {"1", "true", "yes"}
+                if pause_on_choices and not auto_yes:
+                    return (
+                        False,
+                        session_id,
+                        "".join(transcript_parts),
+                        None,
+                        True,
+                        assistant_text.strip()[-1200:],
+                        ["yes", "no"],
+                    )
                 prompt = "yes"
                 continue
 

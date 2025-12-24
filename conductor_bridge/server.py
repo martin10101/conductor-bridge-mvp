@@ -439,6 +439,7 @@ class Bridge:
                         "model": {"type": "string"},
                         "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
                         "timeout_s": {"type": "integer"},
+                        "max_turns": {"type": "integer"},
                     },
                     "required": ["repo_dir", "session_id", "user_input"],
                     "additionalProperties": False,
@@ -1126,6 +1127,7 @@ class Bridge:
         model: Optional[str] = None,
         approval_mode: str = "yolo",
         timeout_s: int = 900,
+        max_turns: int = 2,
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
@@ -1145,6 +1147,7 @@ class Bridge:
             timeout_s=timeout_s,
             project_brief=project_brief,
             track_description=track_description,
+            max_turns=max(1, min(6, int(max_turns))),
             done_check=lambda: False,
         )
         self._set_foreman_context(

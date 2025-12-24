@@ -87,6 +87,9 @@ def create_project(
 .env.*
 !.env.example
 
+# Local bridge artifacts (do not commit)
+.conductor-bridge/
+
 # OS junk
 .DS_Store
 Thumbs.db
