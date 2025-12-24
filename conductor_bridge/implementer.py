@@ -113,7 +113,13 @@ Be concise and focus on the implementation."""
 
         try:
             result = subprocess.run(
-                [self.codex_path, "-p", prompt],
+                [
+                    self.codex_path,
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--full-auto",
+                    prompt,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,

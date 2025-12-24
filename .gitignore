@@ -31,3 +31,6 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Runtime state (generated artifacts + event log)
+state/

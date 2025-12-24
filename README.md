@@ -30,6 +30,12 @@ This installs:
 python -m conductor_bridge.server --http --port 8765
 ```
 
+To run the server as a **stdio MCP server** (for Cursor-style `command` MCP configs), use:
+
+```powershell
+python -m conductor_bridge.server --stdio
+```
+
 The server exposes these MCP tools at `http://127.0.0.1:8765/mcp`:
 
 | Tool | Description |
@@ -38,9 +44,14 @@ The server exposes these MCP tools at `http://127.0.0.1:8765/mcp`:
 | `get_state()` | Get current state |
 | `set_state(partial_update)` | Update state |
 | `append_event(type, payload)` | Log an event |
+| `generate_spec(task_description, ...)` | Generate `spec.md` (Gemini) |
+| `generate_plan(task_description, ...)` | Generate `plan.md` (Gemini) |
+| `submit_handoff(handoff_markdown)` | Write `handoff.md` |
+| `generate_review(...)` | Generate `review.md` (Gemini) |
 | `run_cycle(implementer)` | Run one planning->implementing->review cycle |
 | `pause()` / `resume()` | Control the loop |
 | `get_artifacts()` | Get plan/handoff/review artifacts |
+| `write_artifact(name, content)` | Write an artifact file |
 | `get_status()` | Full status including tool availability |
 
 ### 4. Run the Loop
@@ -57,21 +68,29 @@ Options:
 
 ## Connecting Codex to the MCP Hub
 
+## Using It From Chat (No Terminal)
+
+Once configured, you can run the full loop just by chatting in the Codex panel (inside Cursor):
+
+1. Tell Codex your idea (what to build/change) and which repo folder to work in.
+2. Codex asks Gemini for a plan (`plan.md`), implements it, then asks Gemini to review (`review.md`).
+3. Codex commits and pushes to a new GitHub branch (if the repo has an `origin` remote and you’re logged in).
+
+Artifacts are written to `C:\conductor-bridge-mvp\state\artifacts\` by default.
+
 ### Option 1: Edit config.toml
 
 Add to `~/.codex/config.toml`:
 
 ```toml
-[[mcp_servers]]
-name = "conductor-bridge"
-type = "http"
+[mcp_servers.conductor-bridge]
 url = "http://127.0.0.1:8765/mcp"
 ```
 
 ### Option 2: Use CLI
 
 ```bash
-codex mcp add conductor-bridge --url http://127.0.0.1:8765/mcp
+codex mcp add --url http://127.0.0.1:8765/mcp conductor-bridge
 ```
 
 **Note:** Codex MCP config is shared between CLI and IDE extension, so the Codex panel in Cursor will see the same tools.
@@ -132,15 +151,32 @@ conductor-bridge-mvp/
 - **Codex CLI**: Requires OpenAI API key or login
 - **Claude CLI**: Requires Anthropic API key or login
 
+## Gemini Model Selection
+
+Set a default model for planning/review:
+
+```powershell
+$env:CONDUCTOR_BRIDGE_GEMINI_MODEL = "gemini-3-pro-preview"
+```
+
+Optionally force extensions (comma-separated):
+
+```powershell
+$env:CONDUCTOR_BRIDGE_GEMINI_EXTENSIONS = "conductor"
+```
+
 ## MCP API Examples
 
 ```bash
-# Ping
-curl -X POST http://127.0.0.1:8765/mcp -H "Content-Type: application/json" -d '{"method": "ping"}'
+# Initialize (JSON-RPC 2.0)
+curl -X POST http://127.0.0.1:8765/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 
-# Get status
-curl -X POST http://127.0.0.1:8765/mcp -H "Content-Type: application/json" -d '{"method": "get_status"}'
+# List tools
+curl -X POST http://127.0.0.1:8765/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
-# Run a cycle
-curl -X POST http://127.0.0.1:8765/mcp -H "Content-Type: application/json" -d '{"method": "run_cycle", "params": {"implementer": "simulate"}}'
+# Call a tool (example: get_status)
+curl -X POST http://127.0.0.1:8765/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status","arguments":{}}}'
 ```

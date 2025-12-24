@@ -230,7 +230,7 @@ def main():
     # Print final state
     state = runner.state_manager.get_state()
     print(f"\nFinal State:")
-    print(json.dumps(state.model_dump(), indent=2))
+    print(json.dumps(state.to_dict(), indent=2))
 
     # Print recent events
     events = runner.state_manager.get_events(30)
