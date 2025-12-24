@@ -23,6 +23,7 @@ from .autopilot import create_project, push_branch
 from .conductor_cli_driver import ConductorCliDriver
 from .gemini_client import GeminiClient
 from .implementer import get_best_available_implementer, get_implementer
+from .quality_gate import evaluate_track
 from .state import StateManager
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -224,6 +225,8 @@ class Bridge:
                         "model": {"type": "string"},
                         "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
                         "timeout_s": {"type": "integer"},
+                        "quality_profile": {"type": "string", "enum": ["auto", "micro", "project"]},
+                        "quality_retries": {"type": "integer"},
                     },
                     "required": ["repo_dir", "project_brief", "track_description"],
                     "additionalProperties": False,
@@ -241,8 +244,29 @@ class Bridge:
                         "model": {"type": "string"},
                         "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
                         "timeout_s": {"type": "integer"},
+                        "quality_profile": {"type": "string", "enum": ["auto", "micro", "project"]},
+                        "quality_retries": {"type": "integer"},
                     },
                     "required": ["repo_dir", "project_brief", "track_description"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "conductor_continue",
+                "description": "Continue a paused Conductor session with a user answer (e.g. 'A', 'B', 'yes', 'no').",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "repo_dir": {"type": "string"},
+                        "session_id": {"type": "string"},
+                        "user_input": {"type": "string"},
+                        "project_brief": {"type": "string"},
+                        "track_description": {"type": "string"},
+                        "model": {"type": "string"},
+                        "approval_mode": {"type": "string", "enum": ["default", "auto_edit", "yolo"]},
+                        "timeout_s": {"type": "integer"},
+                    },
+                    "required": ["repo_dir", "session_id", "user_input"],
                     "additionalProperties": False,
                 },
             },
@@ -418,6 +442,8 @@ class Bridge:
         model: Optional[str] = None,
         approval_mode: str = "yolo",
         timeout_s: int = 900,
+        quality_profile: str = "auto",
+        quality_retries: int = 2,
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
@@ -429,11 +455,51 @@ class Bridge:
             project_brief=project_brief,
             track_description=track_description,
         )
+
+        gate = None
+        if result.ok:
+            gate = evaluate_track(repo_dir=repo_dir, profile=quality_profile, user_brief=project_brief)
+            attempt = 0
+            while gate is not None and (not gate.ok) and attempt < max(0, int(quality_retries)) and result.session_id:
+                attempt += 1
+                issues_text = "\n".join(f"- {i}" for i in gate.issues)
+                revise_prompt = (
+                    "Quality gate failed for the generated track `spec.md`/`plan.md`.\n\n"
+                    "Fix the track's files now, WITHOUT adding extra scope.\n"
+                    "Hard requirements:\n"
+                    "- Spec must include: Non-goals/Out of Scope AND Acceptance Criteria (bullet list).\n"
+                    "- Spec must be final and clean (no 'wait/confusing/revised logic' or brainstorming).\n"
+                    "- Plan must be phased and contain checkbox tasks ('- [ ] Task: ...').\n\n"
+                    f"Issues found:\n{issues_text}\n\n"
+                    "When done, reply: DONE"
+                )
+                cont = driver.continue_session(
+                    repo_dir=repo_dir,
+                    model=selected_model,
+                    session_id=result.session_id,
+                    user_input=revise_prompt,
+                    approval_mode=approval_mode,
+                    timeout_s=timeout_s,
+                    project_brief=project_brief,
+                    track_description=track_description,
+                    done_check=lambda: False,
+                )
+                result = cont
+                if result.paused_for_user:
+                    break
+                gate = evaluate_track(repo_dir=repo_dir, profile=quality_profile, user_brief=project_brief)
         return {
             "ok": result.ok,
             "model": selected_model,
+            "session_id": result.session_id,
             "created_paths": result.created_paths,
             "error": result.error,
+            "paused_for_user": result.paused_for_user,
+            "user_prompt": result.user_prompt,
+            "user_choices": result.user_choices,
+            "quality_gate": None
+            if gate is None
+            else {"ok": gate.ok, "profile": gate.profile, "issues": gate.issues, "track_id": gate.track_id},
             "transcript_tail": result.transcript[-4000:],
         }
 
@@ -445,6 +511,8 @@ class Bridge:
         model: Optional[str] = None,
         approval_mode: str = "yolo",
         timeout_s: int = 900,
+        quality_profile: str = "auto",
+        quality_retries: int = 2,
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
@@ -456,11 +524,87 @@ class Bridge:
             project_brief=project_brief,
             track_description=track_description,
         )
+
+        gate = None
+        if result.ok:
+            gate = evaluate_track(repo_dir=repo_dir, profile=quality_profile, user_brief=project_brief)
+            attempt = 0
+            while gate is not None and (not gate.ok) and attempt < max(0, int(quality_retries)) and result.session_id:
+                attempt += 1
+                issues_text = "\n".join(f"- {i}" for i in gate.issues)
+                revise_prompt = (
+                    "Quality gate failed for the generated track `spec.md`/`plan.md`.\n\n"
+                    "Fix the track's files now, WITHOUT adding extra scope.\n"
+                    "Hard requirements:\n"
+                    "- Spec must include: Non-goals/Out of Scope AND Acceptance Criteria (bullet list).\n"
+                    "- Spec must be final and clean (no 'wait/confusing/revised logic' or brainstorming).\n"
+                    "- Plan must be phased and contain checkbox tasks ('- [ ] Task: ...').\n\n"
+                    f"Issues found:\n{issues_text}\n\n"
+                    "When done, reply: DONE"
+                )
+                cont = driver.continue_session(
+                    repo_dir=repo_dir,
+                    model=selected_model,
+                    session_id=result.session_id,
+                    user_input=revise_prompt,
+                    approval_mode=approval_mode,
+                    timeout_s=timeout_s,
+                    project_brief=project_brief,
+                    track_description=track_description,
+                    done_check=lambda: False,
+                )
+                result = cont
+                if result.paused_for_user:
+                    break
+                gate = evaluate_track(repo_dir=repo_dir, profile=quality_profile, user_brief=project_brief)
         return {
             "ok": result.ok,
             "model": selected_model,
+            "session_id": result.session_id,
             "created_paths": result.created_paths,
             "error": result.error,
+            "paused_for_user": result.paused_for_user,
+            "user_prompt": result.user_prompt,
+            "user_choices": result.user_choices,
+            "quality_gate": None
+            if gate is None
+            else {"ok": gate.ok, "profile": gate.profile, "issues": gate.issues, "track_id": gate.track_id},
+            "transcript_tail": result.transcript[-4000:],
+        }
+
+    def tool_conductor_continue(
+        self,
+        repo_dir: str,
+        session_id: str,
+        user_input: str,
+        project_brief: str = "",
+        track_description: str = "",
+        model: Optional[str] = None,
+        approval_mode: str = "yolo",
+        timeout_s: int = 900,
+    ) -> dict[str, Any]:
+        driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
+        selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+        result = driver.continue_session(
+            repo_dir=repo_dir,
+            model=selected_model,
+            session_id=session_id,
+            user_input=user_input,
+            approval_mode=approval_mode,
+            timeout_s=timeout_s,
+            project_brief=project_brief,
+            track_description=track_description,
+            done_check=lambda: False,
+        )
+        return {
+            "ok": result.ok,
+            "model": selected_model,
+            "session_id": result.session_id,
+            "created_paths": result.created_paths,
+            "error": result.error,
+            "paused_for_user": result.paused_for_user,
+            "user_prompt": result.user_prompt,
+            "user_choices": result.user_choices,
             "transcript_tail": result.transcript[-4000:],
         }
 

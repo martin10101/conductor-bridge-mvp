@@ -23,6 +23,9 @@ class ConductorRunResult:
     session_id: Optional[str]
     transcript: str
     created_paths: list[str]
+    paused_for_user: bool = False
+    user_prompt: Optional[str] = None
+    user_choices: Optional[list[str]] = None
     error: Optional[str] = None
 
 
@@ -58,6 +61,16 @@ def _pick_choice_letter(text: str) -> Optional[str]:
     if not matches:
         return None
     return matches[-1].group(1)
+
+def _extract_choice_letters(text: str) -> list[str]:
+    # e.g. "A) Yes", "B) No", "A. Yes", "B. No"
+    letters = re.findall(r"(?m)^\s*([A-Z])\s*[\)\.]\s+\S+", text or "")
+    # Keep order, dedupe
+    out: list[str] = []
+    for l in letters:
+        if l not in out:
+            out.append(l)
+    return out
 
 
 def _needs_yes_no(text: str) -> bool:
@@ -125,7 +138,7 @@ class ConductorCliDriver:
         repo = Path(repo_dir)
         before = _snapshot_tree(repo / "conductor", relative_to=repo)
 
-        ok, session_id, transcript, error = self._run_flow(
+        ok, session_id, transcript, error, paused, prompt_text, choices = self._run_flow(
             repo=repo,
             model=model,
             approval_mode=approval_mode,
@@ -145,6 +158,9 @@ class ConductorCliDriver:
             session_id=session_id,
             transcript=transcript,
             created_paths=created,
+            paused_for_user=paused,
+            user_prompt=prompt_text,
+            user_choices=choices,
             error=error,
         )
 
@@ -163,7 +179,7 @@ class ConductorCliDriver:
         tracks_dir = repo / "conductor" / "tracks"
         before = _snapshot_tree(tracks_dir, relative_to=repo)
 
-        ok, session_id, transcript, error = self._run_flow(
+        ok, session_id, transcript, error, paused, prompt_text, choices = self._run_flow(
             repo=repo,
             model=model,
             approval_mode=approval_mode,
@@ -183,6 +199,51 @@ class ConductorCliDriver:
             session_id=session_id,
             transcript=transcript,
             created_paths=created,
+            paused_for_user=paused,
+            user_prompt=prompt_text,
+            user_choices=choices,
+            error=error,
+        )
+
+    def continue_session(
+        self,
+        *,
+        repo_dir: str,
+        model: str,
+        session_id: str,
+        user_input: str,
+        approval_mode: str = "yolo",
+        timeout_s: int = 900,
+        max_turns: int = 20,
+        project_brief: str = "",
+        track_description: str = "",
+        done_check=None,
+    ) -> ConductorRunResult:
+        repo = Path(repo_dir)
+        before = _snapshot_tree(repo / "conductor", relative_to=repo)
+        ok, sid, transcript, error, paused, prompt_text, choices = self._run_flow(
+            repo=repo,
+            model=model,
+            approval_mode=approval_mode,
+            timeout_s=timeout_s,
+            max_turns=max_turns,
+            initial_prompt=user_input,
+            project_brief=project_brief,
+            track_description=track_description,
+            done_check=done_check or (lambda: False),
+            pause_on_choices=True,
+        )
+        after = _snapshot_tree(repo / "conductor", relative_to=repo)
+        created = sorted(after - before)
+        return ConductorRunResult(
+            ok=ok,
+            model=model,
+            session_id=sid or session_id,
+            transcript=transcript,
+            created_paths=created,
+            paused_for_user=paused,
+            user_prompt=prompt_text,
+            user_choices=choices,
             error=error,
         )
 
@@ -198,7 +259,8 @@ class ConductorCliDriver:
         project_brief: str,
         track_description: str,
         done_check,
-    ) -> tuple[bool, Optional[str], str, Optional[str]]:
+        pause_on_choices: bool = True,
+    ) -> tuple[bool, Optional[str], str, Optional[str], bool, Optional[str], Optional[list[str]]]:
         start = time.time()
         transcript_parts: list[str] = []
 
@@ -207,9 +269,9 @@ class ConductorCliDriver:
 
         for _turn in range(max_turns):
             if done_check():
-                return True, session_id, "".join(transcript_parts), None
+                return True, session_id, "".join(transcript_parts), None, False, None, None
             if time.time() - start > timeout_s:
-                return False, session_id, "".join(transcript_parts), "timeout"
+                return False, session_id, "".join(transcript_parts), "timeout", False, None, None
 
             ok, new_session_id, assistant_text, raw_out, err = self._run_turn(
                 repo=repo,
@@ -230,18 +292,41 @@ class ConductorCliDriver:
                 transcript_parts.append(raw_out[-2000:] + "\n")
 
             if done_check():
-                return True, session_id, "".join(transcript_parts), None
+                return True, session_id, "".join(transcript_parts), None, False, None, None
 
             if not ok and err:
                 # If a turn fails, stop early (Conductor prompts often instruct to halt).
-                return False, session_id, "".join(transcript_parts), err
+                return False, session_id, "".join(transcript_parts), err, False, None, None
 
             if not assistant_text:
                 # No assistant output; nudge with brief.
                 prompt = project_brief
                 continue
 
+            choices = _extract_choice_letters(assistant_text)
+            if pause_on_choices and choices:
+                # Pause whenever Conductor asks for A/B style input.
+                return (
+                    False,
+                    session_id,
+                    "".join(transcript_parts),
+                    None,
+                    True,
+                    assistant_text.strip()[-1200:],
+                    choices,
+                )
+
             if _needs_yes_no(assistant_text):
+                if pause_on_choices:
+                    return (
+                        False,
+                        session_id,
+                        "".join(transcript_parts),
+                        None,
+                        True,
+                        assistant_text.strip()[-1200:],
+                        ["yes", "no"],
+                    )
                 prompt = "yes"
                 continue
 
@@ -261,7 +346,7 @@ class ConductorCliDriver:
             # If it's not a question, ask it to continue.
             prompt = "continue"
 
-        return False, session_id, "".join(transcript_parts), "max_turns_exceeded"
+        return False, session_id, "".join(transcript_parts), "max_turns_exceeded", False, None, None
 
     def _run_turn(
         self,
