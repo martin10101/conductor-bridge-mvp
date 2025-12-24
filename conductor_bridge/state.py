@@ -53,6 +53,19 @@ class BridgeState:
     last_updated: str = field(default_factory=_utcnow_iso)
     current_task: Optional[str] = None
     error: Optional[str] = None
+    last_repo_dir: Optional[str] = None
+    last_project_brief: Optional[str] = None
+    last_track_description: Optional[str] = None
+    last_conductor_model: Optional[str] = None
+    last_conductor_session_id: Optional[str] = None
+    last_conductor_paused_for_user: bool = False
+    last_conductor_user_prompt: Optional[str] = None
+    last_conductor_user_choices: Optional[list[str]] = None
+    last_track_id: Optional[str] = None
+    last_quality_gate_ok: Optional[bool] = None
+    last_quality_gate_issues: Optional[list[str]] = None
+    last_review_score_1_to_10: Optional[int] = None
+    last_review_issues: Optional[list[str]] = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BridgeState":
@@ -63,6 +76,25 @@ class BridgeState:
             last_updated=str(data.get("last_updated", _utcnow_iso())),
             current_task=data.get("current_task", None),
             error=data.get("error", None),
+            last_repo_dir=data.get("last_repo_dir", None),
+            last_project_brief=data.get("last_project_brief", None),
+            last_track_description=data.get("last_track_description", None),
+            last_conductor_model=data.get("last_conductor_model", None),
+            last_conductor_session_id=data.get("last_conductor_session_id", None),
+            last_conductor_paused_for_user=bool(data.get("last_conductor_paused_for_user", False)),
+            last_conductor_user_prompt=data.get("last_conductor_user_prompt", None),
+            last_conductor_user_choices=list(data.get("last_conductor_user_choices") or [])
+            if data.get("last_conductor_user_choices") is not None
+            else None,
+            last_track_id=data.get("last_track_id", None),
+            last_quality_gate_ok=data.get("last_quality_gate_ok", None),
+            last_quality_gate_issues=list(data.get("last_quality_gate_issues") or [])
+            if data.get("last_quality_gate_issues") is not None
+            else None,
+            last_review_score_1_to_10=int(data.get("last_review_score_1_to_10"))
+            if data.get("last_review_score_1_to_10") is not None
+            else None,
+            last_review_issues=list(data.get("last_review_issues") or []) if data.get("last_review_issues") is not None else None,
         )
 
     def to_dict(self) -> dict[str, Any]:

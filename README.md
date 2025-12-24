@@ -61,6 +61,12 @@ The server exposes these MCP tools at `http://127.0.0.1:8765/mcp`:
 | `write_artifact(name, content)` | Write an artifact file |
 | `get_status()` | Full status including tool availability |
 
+### Foreman UI (optional)
+
+The server also exposes a tiny web UI to show the latest Conductor prompt and let you answer A/B questions:
+
+- `http://127.0.0.1:8765/foreman`
+
 ### 4. Run the Loop
 
 ```powershell
@@ -170,6 +176,23 @@ Optionally force extensions (comma-separated):
 
 ```powershell
 $env:CONDUCTOR_BRIDGE_GEMINI_EXTENSIONS = "conductor"
+```
+
+## Shell Safety Policy (important)
+
+Conductor may request `run_shell_command` while generating specs/plans. By default, the bridge runs in a strict allowlist mode:
+
+- Only a small set of read-only commands is allowed (git status/log/diff, directory listing, file reads).
+- Commands are locked to a git repo root; compound commands and redirection are blocked.
+
+Override with environment variables:
+
+```powershell
+# Disable shell entirely
+$env:CONDUCTOR_BRIDGE_SHELL_POLICY = "disabled"
+
+# Dry-run (log what would be executed, but do not run)
+$env:CONDUCTOR_BRIDGE_SHELL_DRY_RUN = "true"
 ```
 
 ## MCP API Examples

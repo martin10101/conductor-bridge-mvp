@@ -266,6 +266,8 @@ class ConductorCliDriver:
 
         session_id: Optional[str] = None
         prompt = initial_prompt
+        last_assistant: Optional[str] = None
+        repeat_assistant_count = 0
 
         for _turn in range(max_turns):
             if done_check():
@@ -286,6 +288,11 @@ class ConductorCliDriver:
             transcript_parts.append(f"[user] {prompt}\n")
             if assistant_text:
                 transcript_parts.append(assistant_text.rstrip() + "\n")
+                if assistant_text.strip() == (last_assistant or "").strip():
+                    repeat_assistant_count += 1
+                else:
+                    repeat_assistant_count = 0
+                    last_assistant = assistant_text
             if err:
                 transcript_parts.append(f"[gemini_error] {err}\n")
             if raw_out and not assistant_text:
@@ -303,6 +310,10 @@ class ConductorCliDriver:
                 # No assistant output; nudge with brief.
                 prompt = project_brief
                 continue
+
+            if repeat_assistant_count >= 2:
+                # Avoid infinite loops where Conductor repeats the same prompt/output.
+                return False, session_id, "".join(transcript_parts), "stuck_repeating_output", False, None, None
 
             choices = _extract_choice_letters(assistant_text)
             if pause_on_choices and choices:

@@ -25,9 +25,110 @@ from .gemini_client import GeminiClient
 from .implementer import get_best_available_implementer, get_implementer
 from .quality_gate import evaluate_track
 from .reviewer import review_track
+from .shell_safety import decide_shell_command
 from .state import StateManager
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
+
+_FOREMAN_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Conductor Foreman</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }
+      .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin: 12px 0; }
+      pre { background: #f7f7f7; padding: 12px; border-radius: 8px; overflow: auto; }
+      button { padding: 10px 12px; border-radius: 8px; border: 1px solid #ccc; background: white; cursor: pointer; }
+      button.primary { background: #111; color: white; border-color: #111; }
+      .muted { color: #666; }
+      input { padding: 10px 12px; border-radius: 8px; border: 1px solid #ccc; min-width: 260px; }
+    </style>
+  </head>
+  <body>
+    <h1>Conductor Foreman</h1>
+    <p class="muted">Shows the latest Conductor session state and lets you answer A/B prompts without using a terminal.</p>
+
+    <div class="card">
+      <div class="row">
+        <button class="primary" id="refreshBtn" type="button">Refresh</button>
+        <span class="muted" id="statusLine"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Prompt</h2>
+      <pre id="prompt">(no prompt)</pre>
+      <div class="row" id="choices"></div>
+      <div class="row" style="margin-top: 12px;">
+        <input id="freeform" placeholder="Type an answer (e.g. A, yes, etc.)" />
+        <button id="sendBtn" type="button">Send</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>State</h2>
+      <pre id="state">{}</pre>
+    </div>
+
+    <div class="card">
+      <h2>Recent Events</h2>
+      <pre id="events">[]</pre>
+    </div>
+
+    <script>
+      async function refresh() {
+        const res = await fetch('/foreman/status');
+        const data = await res.json();
+        const st = data.state || {};
+        document.getElementById('state').textContent = JSON.stringify(st, null, 2);
+        document.getElementById('events').textContent = JSON.stringify(data.events || [], null, 2);
+
+        const paused = !!st.last_conductor_paused_for_user;
+        const sid = st.last_conductor_session_id || '';
+        const model = st.last_conductor_model || '';
+        document.getElementById('statusLine').textContent =
+          'paused=' + paused + ' session_id=' + sid + (model ? (' model=' + model) : '');
+
+        document.getElementById('prompt').textContent = st.last_conductor_user_prompt || '(no prompt)';
+
+        const choicesEl = document.getElementById('choices');
+        choicesEl.innerHTML = '';
+        const choices = st.last_conductor_user_choices || [];
+        for (const c of choices) {
+          const b = document.createElement('button');
+          b.textContent = c;
+          b.addEventListener('click', () => sendAnswer(c));
+          choicesEl.appendChild(b);
+        }
+      }
+
+      async function sendAnswer(answer) {
+        const res = await fetch('/foreman/answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_input: answer })
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          alert('Error: ' + txt);
+          return;
+        }
+        await refresh();
+      }
+
+      document.getElementById('refreshBtn').addEventListener('click', refresh);
+      document.getElementById('sendBtn').addEventListener('click', () => {
+        const v = (document.getElementById('freeform').value || '').trim();
+        if (v) sendAnswer(v);
+      });
+      refresh();
+    </script>
+  </body>
+</html>
+"""
 
 
 def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
@@ -93,6 +194,74 @@ class Bridge:
     def __init__(self, state_dir: str):
         self.state_manager = StateManager(state_dir)
         self.gemini_client = GeminiClient()
+        self._last_repo_dir: Optional[str] = None
+
+    def _set_foreman_context(
+        self,
+        *,
+        repo_dir: Optional[str] = None,
+        project_brief: Optional[str] = None,
+        track_description: Optional[str] = None,
+        model: Optional[str] = None,
+        session_id: Optional[str] = None,
+        paused_for_user: Optional[bool] = None,
+        user_prompt: Optional[str] = None,
+        user_choices: Optional[list[str]] = None,
+        track_id: Optional[str] = None,
+        quality_gate: Optional[dict[str, Any]] = None,
+        review: Optional[dict[str, Any]] = None,
+    ) -> None:
+        update: dict[str, Any] = {}
+        if repo_dir:
+            update["last_repo_dir"] = repo_dir
+            self._last_repo_dir = repo_dir
+        if project_brief is not None:
+            update["last_project_brief"] = project_brief
+        if track_description is not None:
+            update["last_track_description"] = track_description
+        if model is not None:
+            update["last_conductor_model"] = model
+        if session_id is not None:
+            update["last_conductor_session_id"] = session_id
+        if paused_for_user is not None:
+            update["last_conductor_paused_for_user"] = bool(paused_for_user)
+        if user_prompt is not None:
+            update["last_conductor_user_prompt"] = user_prompt
+        if user_choices is not None:
+            update["last_conductor_user_choices"] = user_choices
+        if track_id is not None:
+            update["last_track_id"] = track_id
+        if quality_gate is not None:
+            update["last_quality_gate_ok"] = quality_gate.get("ok")
+            update["last_quality_gate_issues"] = quality_gate.get("issues")
+        if review is not None:
+            update["last_review_score_1_to_10"] = review.get("score_1_to_10")
+            update["last_review_issues"] = review.get("issues")
+        if update:
+            self.state_manager.set_state(update)
+
+    def _write_run_report(self, *, repo_dir: str, name: str, payload: dict[str, Any]) -> Optional[str]:
+        try:
+            repo = Path(repo_dir)
+            out_dir = repo / ".conductor-bridge" / "run-reports"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "report"
+            ts = uuid.uuid4().hex[:8]
+            path = out_dir / f"{safe}-{ts}.json"
+            _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            return str(path)
+        except Exception:
+            return None
+
+    def _find_git_root(self, path: Path) -> Optional[Path]:
+        cur = path
+        for _ in range(10):
+            if (cur / ".git").exists():
+                return cur
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        return None
 
     def _write_artifact(self, name: str, content: str, artifacts_dir: Optional[str] = None) -> None:
         safe_name = _validate_artifact_name(name)
@@ -414,22 +583,36 @@ class Bridge:
         return self.state_manager.append_event(type, payload or {}).to_dict()
 
     def tool_run_shell_command(self, command: str, cwd: Optional[str] = None, timeout_s: int = 60) -> dict[str, Any]:
-        if not isinstance(command, str) or not command.strip():
-            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "command must be a non-empty string"}
-        if len(command) > 8000:
-            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "command too long"}
+        policy = (os.environ.get("CONDUCTOR_BRIDGE_SHELL_POLICY") or "allowlist").strip().lower()
+        if policy in {"off", "disabled", "none"}:
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "Shell access is disabled by policy."}
 
-        workdir = cwd or os.getcwd()
+        decision = decide_shell_command(command)
+        if not decision.allowed:
+            self.state_manager.append_event(
+                "shell_command_blocked",
+                {"command": command, "cwd": cwd, "policy": policy, "reason": decision.reason},
+            )
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": decision.reason}
+
+        workdir = cwd or self._last_repo_dir or os.getcwd()
         try:
             workdir_path = Path(workdir).resolve()
         except Exception:
             return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "Invalid cwd"}
 
-        # Safety guardrails: keep commands scoped and block obviously destructive patterns.
+        # Hard safety model:
+        # - Lock execution to a git repo root (prevents accidentally touching random folders).
+        # - Allow only within configured roots (extra defense).
+        git_root = self._find_git_root(workdir_path)
+        if git_root is None:
+            return {"ok": False, "exit_code": -1, "stdout": "", "stderr": "Refusing to run outside a git repo."}
+
         allow_roots_env = os.environ.get("CONDUCTOR_BRIDGE_SHELL_ALLOWED_ROOTS") or ""
         default_roots = [
             Path(os.getcwd()),
             Path.home() / "Downloads" / "codex-projects",
+            git_root,
         ]
         extra = [Path(p.strip()) for p in allow_roots_env.split(",") if p.strip()]
         allowed_roots = []
@@ -449,24 +632,15 @@ class Bridge:
                     "stderr": f"Refusing to run command outside allowed roots: {workdir_path}",
                 }
 
-        deny_patterns = [
-            (r"(?i)\b(remove-item|del|erase|rm|rmdir|rd)\b", "delete files"),
-            (r"(?i)\bformat\b", "format disk"),
-            (r"(?i)\bdiskpart\b", "disk partitioning"),
-            (r"(?i)\breg(\.exe)?\b", "registry editing"),
-            (r"(?i)\bshutdown\b|\brestart-computer\b|\bstop-computer\b", "shutdown/restart"),
-            (r"(?i)\btaskkill\b|\bstop-process\b", "kill processes"),
-            (r"(?i)\binvoke-expression\b|\biex\b", "execute dynamic code"),
-            (r"(?i)\bgit\s+clean\b", "destructive git clean"),
-            (r"(?i)\bgit\s+reset\s+--hard\b", "destructive git reset"),
-            (r"(?i)\bgit\s+push\s+--force\b", "force push"),
-        ]
-        for pat, reason in deny_patterns:
-            if re.search(pat, command):
-                return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"Blocked potentially dangerous command ({reason})."}
-
         timeout_s = int(timeout_s) if isinstance(timeout_s, int) or str(timeout_s).isdigit() else 60
         timeout_s = max(1, min(600, timeout_s))
+        dry_run = (os.environ.get("CONDUCTOR_BRIDGE_SHELL_DRY_RUN") or "").strip().lower() in {"1", "true", "yes"}
+        if dry_run:
+            self.state_manager.append_event(
+                "shell_command_dry_run",
+                {"command": command, "cwd": str(workdir_path), "git_root": str(git_root), "timeout_s": timeout_s},
+            )
+            return {"ok": True, "exit_code": 0, "stdout": "", "stderr": "dry_run"}
         try:
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", command],
@@ -476,6 +650,16 @@ class Bridge:
                 timeout=timeout_s,
                 shell=False,
             )
+            self.state_manager.append_event(
+                "shell_command",
+                {
+                    "command": command,
+                    "cwd": str(workdir_path),
+                    "git_root": str(git_root),
+                    "timeout_s": timeout_s,
+                    "exit_code": result.returncode,
+                },
+            )
             return {
                 "ok": result.returncode == 0,
                 "exit_code": result.returncode,
@@ -483,12 +667,26 @@ class Bridge:
                 "stderr": result.stderr,
             }
         except subprocess.TimeoutExpired:
+            self.state_manager.append_event(
+                "shell_command_timeout",
+                {"command": command, "cwd": str(workdir_path), "git_root": str(git_root), "timeout_s": timeout_s},
+            )
             return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"Timed out after {timeout_s}s"}
         except Exception as e:
+            self.state_manager.append_event(
+                "shell_command_error",
+                {"command": command, "cwd": str(workdir_path), "git_root": str(git_root), "error": f"{type(e).__name__}: {e}"},
+            )
             return {"ok": False, "exit_code": -1, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
 
     def tool_conductor_review_track(self, repo_dir: str, track_id: str = "", user_brief: str = "") -> dict[str, Any]:
         r = review_track(repo_dir=repo_dir, track_id=track_id or None, user_brief=user_brief)
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=user_brief,
+            track_id=r.track_id,
+            review={"score_1_to_10": r.score_1_to_10, "issues": r.issues},
+        )
         return {
             "ok": True,
             "track_id": r.track_id,
@@ -533,6 +731,18 @@ class Bridge:
             )
             current_session_id = cont.session_id or current_session_id
             if cont.paused_for_user:
+                self._set_foreman_context(
+                    repo_dir=repo_dir,
+                    project_brief=project_brief,
+                    track_description=track_description,
+                    model=selected_model,
+                    session_id=current_session_id,
+                    paused_for_user=True,
+                    user_prompt=cont.user_prompt,
+                    user_choices=cont.user_choices,
+                    track_id=last_review.track_id,
+                    review={"score_1_to_10": last_review.score_1_to_10, "issues": last_review.issues},
+                )
                 return {
                     "ok": cont.ok,
                     "model": selected_model,
@@ -549,6 +759,16 @@ class Bridge:
                     "transcript_tail": cont.transcript[-4000:],
                 }
 
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+            session_id=current_session_id,
+            paused_for_user=False,
+            track_id=last_review.track_id,
+            review={"score_1_to_10": last_review.score_1_to_10, "issues": last_review.issues},
+        )
         return {
             "ok": True,
             "model": selected_model,
@@ -615,6 +835,12 @@ class Bridge:
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+        )
         result = driver.run_setup(
             repo_dir=repo_dir,
             model=selected_model,
@@ -685,6 +911,39 @@ class Bridge:
                 if result.paused_for_user:
                     break
                 review = review_track(repo_dir=repo_dir, user_brief=project_brief)
+
+        quality_gate_payload = None if gate is None else {"ok": gate.ok, "issues": gate.issues, "track_id": gate.track_id}
+        review_payload = (
+            None
+            if review is None
+            else {"track_id": review.track_id, "score_1_to_10": review.score_1_to_10, "issues": review.issues}
+        )
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+            session_id=result.session_id,
+            paused_for_user=result.paused_for_user,
+            user_prompt=result.user_prompt,
+            user_choices=result.user_choices,
+            track_id=(gate.track_id if gate and gate.track_id else (review.track_id if review else None)),
+            quality_gate=quality_gate_payload,
+            review=review_payload,
+        )
+        report_path = self._write_run_report(
+            repo_dir=repo_dir,
+            name="conductor_setup",
+            payload={
+                "tool": "conductor_setup",
+                "repo_dir": repo_dir,
+                "model": selected_model,
+                "session_id": result.session_id,
+                "paused_for_user": result.paused_for_user,
+                "quality_gate": quality_gate_payload,
+                "review": review_payload,
+            },
+        )
         return {
             "ok": result.ok,
             "model": selected_model,
@@ -705,6 +964,7 @@ class Bridge:
                 "strengths": review.strengths,
                 "issues": review.issues,
             },
+            "run_report_path": report_path,
             "transcript_tail": result.transcript[-4000:],
         }
 
@@ -723,6 +983,12 @@ class Bridge:
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+        )
         result = driver.run_new_track(
             repo_dir=repo_dir,
             model=selected_model,
@@ -793,6 +1059,39 @@ class Bridge:
                 if result.paused_for_user:
                     break
                 review = review_track(repo_dir=repo_dir, user_brief=project_brief)
+
+        quality_gate_payload = None if gate is None else {"ok": gate.ok, "issues": gate.issues, "track_id": gate.track_id}
+        review_payload = (
+            None
+            if review is None
+            else {"track_id": review.track_id, "score_1_to_10": review.score_1_to_10, "issues": review.issues}
+        )
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+            session_id=result.session_id,
+            paused_for_user=result.paused_for_user,
+            user_prompt=result.user_prompt,
+            user_choices=result.user_choices,
+            track_id=(gate.track_id if gate and gate.track_id else (review.track_id if review else None)),
+            quality_gate=quality_gate_payload,
+            review=review_payload,
+        )
+        report_path = self._write_run_report(
+            repo_dir=repo_dir,
+            name="conductor_new_track",
+            payload={
+                "tool": "conductor_new_track",
+                "repo_dir": repo_dir,
+                "model": selected_model,
+                "session_id": result.session_id,
+                "paused_for_user": result.paused_for_user,
+                "quality_gate": quality_gate_payload,
+                "review": review_payload,
+            },
+        )
         return {
             "ok": result.ok,
             "model": selected_model,
@@ -813,6 +1112,7 @@ class Bridge:
                 "strengths": review.strengths,
                 "issues": review.issues,
             },
+            "run_report_path": report_path,
             "transcript_tail": result.transcript[-4000:],
         }
 
@@ -829,6 +1129,13 @@ class Bridge:
     ) -> dict[str, Any]:
         driver = ConductorCliDriver(gemini_path=self.gemini_client.gemini_path or "gemini")
         selected_model = model or os.environ.get("CONDUCTOR_BRIDGE_GEMINI_MODEL") or "gemini-3-flash-preview"
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+            session_id=session_id,
+        )
         result = driver.continue_session(
             repo_dir=repo_dir,
             model=selected_model,
@@ -840,6 +1147,27 @@ class Bridge:
             track_description=track_description,
             done_check=lambda: False,
         )
+        self._set_foreman_context(
+            repo_dir=repo_dir,
+            project_brief=project_brief,
+            track_description=track_description,
+            model=selected_model,
+            session_id=result.session_id or session_id,
+            paused_for_user=result.paused_for_user,
+            user_prompt=result.user_prompt,
+            user_choices=result.user_choices,
+        )
+        report_path = self._write_run_report(
+            repo_dir=repo_dir,
+            name="conductor_continue",
+            payload={
+                "tool": "conductor_continue",
+                "repo_dir": repo_dir,
+                "model": selected_model,
+                "session_id": result.session_id or session_id,
+                "paused_for_user": result.paused_for_user,
+            },
+        )
         return {
             "ok": result.ok,
             "model": selected_model,
@@ -849,6 +1177,7 @@ class Bridge:
             "paused_for_user": result.paused_for_user,
             "user_prompt": result.user_prompt,
             "user_choices": result.user_choices,
+            "run_report_path": report_path,
             "transcript_tail": result.transcript[-4000:],
         }
 
@@ -1194,6 +1523,48 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
     server: BridgeHTTPServer
 
     def do_POST(self):
+        if self.path == "/foreman/answer":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode("utf-8", errors="replace") if content_length else ""
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self.send_error(400, "Invalid JSON")
+                return
+
+            user_input = (payload.get("user_input") or "").strip()
+            if not user_input:
+                self.send_error(400, "Missing user_input")
+                return
+
+            bridge = self.server.router.bridge
+            st = bridge.state_manager.get_state().to_dict()
+            repo_dir = str(payload.get("repo_dir") or st.get("last_repo_dir") or "")
+            session_id = str(payload.get("session_id") or st.get("last_conductor_session_id") or "")
+            model = str(payload.get("model") or st.get("last_conductor_model") or "")
+            project_brief = str(st.get("last_project_brief") or "")
+            track_description = str(st.get("last_track_description") or "")
+
+            if not repo_dir or not session_id:
+                self.send_error(409, "No active Conductor session in state")
+                return
+
+            result = bridge.tool_conductor_continue(
+                repo_dir=repo_dir,
+                session_id=session_id,
+                user_input=user_input,
+                project_brief=project_brief,
+                track_description=track_description,
+                model=model or None,
+                approval_mode="yolo",
+                timeout_s=900,
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+            return
+
         if self.path != "/mcp":
             self.send_error(404, "Not Found")
             return
@@ -1247,6 +1618,24 @@ class MCPHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
+            return
+
+        if self.path == "/foreman":
+            html = _FOREMAN_HTML
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+            return
+
+        if self.path == "/foreman/status":
+            bridge = self.server.router.bridge
+            state = bridge.state_manager.get_state().to_dict()
+            events = [e.to_dict() for e in bridge.state_manager.get_events(limit=50)]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"state": state, "events": events}, ensure_ascii=False).encode("utf-8"))
             return
 
         if self.path.startswith("/mcp"):
